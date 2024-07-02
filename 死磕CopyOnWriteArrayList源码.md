@@ -76,6 +76,10 @@ public class CopyOnWriteArrayList<E>
 	 * 如果参数集合就是CopyOnWriteArrayList，那就直接将array指向集合的数组
 	 * 如果参数集合不是CopyOnWriteArrayList，那么需要将原集合中的对象转存到新的数组中，然后将array指向新的数组
 	 *
+	 * 还有一点，CopyOnWriteArrayList提供的构造参数可以体现出设计者对于CopyOnWriteArrayList使用的一个情景：
+	 * 设计者希望使用CopyOnWriteArrayList时，尽量使用批量插入的方式。如果是单个插入的话，会带来高额的系统负担，每一个插入操作都会创建一个新的数组。
+	 * 内存中会有大量的垃圾内存需要回收处理。
+	 *
 	 * @param c
 	 * @throws NullPointerException 如果c为空，会抛出空指针异常
 	 */
@@ -251,12 +255,8 @@ public class CopyOnWriteArrayList<E>
 	 * 返回一个包含此列表中所有元素的数组
 	 * 按正确的顺序（从第一个元素到最后一个元素）。
 	 *
-	 * <p>返回的数组将是“安全的”，因为没有对它的引用
-	 * 由该列表维护。  （换句话说，这个方法必须分配
-	 * 一个新数组）。  因此，调用者可以自由修改返回的数组。
-	 *
-	 * <p>此方法充当基于数组和基于集合之间的桥梁
-	 * API。
+	 * 并且，此时返回的array是一个安全的数组，CopyOnWriteArrayList本身的array指向的对象不变，也不提供当前的array。
+	 * 直接提供一个当前array的克隆
 	 *
 	 * @return an array containing all the elements in this list
 	 */
@@ -316,8 +316,7 @@ public class CopyOnWriteArrayList<E>
 		}
 	}
 
-	// Positional Access Operations
-
+	// 下标访问操作
 	@SuppressWarnings("unchecked")
 	static <E> E elementAt(Object[] a, int index) {
 		return (E) a[index];
@@ -365,28 +364,37 @@ public class CopyOnWriteArrayList<E>
 	}
 
 	/**
-	 * Replaces the element at the specified position in this list with the
-	 * specified element.
-	 *
+	 * 将指定index位置的元素值进行修改
+	 * @param index 修改元素的位置
+	 * @param element 修改之后的值
 	 * @throws IndexOutOfBoundsException {@inheritDoc}
 	 */
 	public E set(int index, E element) {
 		synchronized (lock) {
+			// 获取当前array，并且将es指向当前array
 			Object[] es = getArray();
+			// 先获取指定index的值
 			E oldValue = elementAt(es, index);
 
+			// 判断指定index的值和修改的值进行比较
 			if (oldValue != element) {
+				// 如果指定index的值和要修改的值不同，那么就将es指向一个array的克隆，对es进行修改
 				es = es.clone();
 				es[index] = element;
 			}
-			// Ensure volatile write semantics even when oldvalue == element
+			/**
+			 * 无论是否对值进行修改，都将array指向es的新数组。
+			 * 因为要考虑到CAS操作的ABA问题
+			 */
 			setArray(es);
 			return oldValue;
 		}
 	}
 
 	/**
-	 * Appends the specified element to the end of this list.
+	 * 使用尾插法，在数组最后插入元素。
+	 * 如果有大量数据的情况下，不推荐使用add()方法，可以使用addAllAbsent()方法。
+	 * 大量数据循环单次插入的情况，会导致创建大量的垃圾数组，对内存不友好。
 	 *
 	 * @param e element to be appended to this list
 	 * @return {@code true} (as specified by {@link Collection#add})
@@ -395,43 +403,68 @@ public class CopyOnWriteArrayList<E>
 		synchronized (lock) {
 			Object[] es = getArray();
 			int len = es.length;
+			/**
+			 * 最主要的，还是写操作会新建一个数组，对新建的数组进行操作。
+			 * 还有一点，每次进行写操作的时候，数组的长度只是+1，而不像ArrayList那样直接扩容1.5倍。
+			 * 其实还是推荐往CopyOnWriteArrayList进行大量数据写入的时候，通过集合或者数组的方式进行写入。
+			 */
 			es = Arrays.copyOf(es, len + 1);
 			es[len] = e;
+			// 操作对新数组操作完成之后，将array指向新数组。
 			setArray(es);
 			return true;
 		}
 	}
 
 	/**
-	 * Inserts the specified element at the specified position in this
-	 * list. Shifts the element currently at that position (if any) and
-	 * any subsequent elements to the right (adds one to their indices).
+	 * 向指定位置插入元素
+	 * 这个方法可以分为两种情况
+	 * 1.在末尾插入
+	 * 2.在中间插入
 	 *
+	 * @param index 插入元素的位置
+	 * @param element 插入的元素值
 	 * @throws IndexOutOfBoundsException {@inheritDoc}
 	 */
 	public void add(int index, E element) {
 		synchronized (lock) {
 			Object[] es = getArray();
 			int len = es.length;
+			// 判断插入的位置是否合理
 			if (index > len || index < 0)
 				throw new IndexOutOfBoundsException(outOfBounds(index, len));
 			Object[] newElements;
+			// 找到数组从后往前的插入位置
 			int numMoved = len - index;
 			if (numMoved == 0)
+				/**
+				 * 此时，在末尾进行插入
+				 * 那么就克隆一个新数组，且数组长度相较于原数组+1
+				 */
 				newElements = Arrays.copyOf(es, len + 1);
 			else {
+				/**
+				 * 此时，在数组的中间插入。
+				 * 操作步骤为：
+				 * 1.创建一个新数组，数组长度为原数组+1
+				 * 2.将插入位置之前的原数组的值，插入到新数组中
+				 * 3.将插入位置之后的原数组的值，插入到新数组中
+				 */
 				newElements = new Object[len + 1];
 				System.arraycopy(es, 0, newElements, 0, index);
 				System.arraycopy(es, index, newElements, index + 1,
 						numMoved);
 			}
+			// 在克隆出来的新数组的位置插入元素
 			newElements[index] = element;
+			// 将array指向新数组
 			setArray(newElements);
 		}
 	}
 
 	/**
 	 * {@inheritDoc}
+	 * 头插
 	 *
 	 * @since 21
 	 */
@@ -441,6 +474,7 @@ public class CopyOnWriteArrayList<E>
 
 	/**
 	 * {@inheritDoc}
+	 * 尾插
 	 *
 	 * @since 21
 	 */
@@ -451,9 +485,7 @@ public class CopyOnWriteArrayList<E>
 	}
 
 	/**
-	 * Removes the element at the specified position in this list.
-	 * Shifts any subsequent elements to the left (subtracts one from their
-	 * indices).  Returns the element that was removed from the list.
+	 * 移除指定位置的元素
 	 *
 	 * @throws IndexOutOfBoundsException {@inheritDoc}
 	 */
@@ -463,15 +495,19 @@ public class CopyOnWriteArrayList<E>
 			int len = es.length;
 			E oldValue = elementAt(es, index);
 			int numMoved = len - index - 1;
+			// 还是对新数组进行操作
 			Object[] newElements;
 			if (numMoved == 0)
+				// 从尾部删除就很简单，直接将es拷贝的长度-1即可
 				newElements = Arrays.copyOf(es, len - 1);
 			else {
+				// 从中间删除的操作和插入的操作类似，还是分段进行复制。
 				newElements = new Object[len - 1];
 				System.arraycopy(es, 0, newElements, 0, index);
 				System.arraycopy(es, index + 1, newElements, index,
 						numMoved);
 			}
+			// 将array指向新数组即可
 			setArray(newElements);
 			return oldValue;
 		}
@@ -509,19 +545,16 @@ public class CopyOnWriteArrayList<E>
 	}
 
 	/**
-	 * Removes the first occurrence of the specified element from this list,
-	 * if it is present.  If this list does not contain the element, it is
-	 * unchanged.  More formally, removes the element with the lowest index
-	 * {@code i} such that {@code Objects.equals(o, get(i))}
-	 * (if such an element exists).  Returns {@code true} if this list
-	 * contained the specified element (or equivalently, if this list
-	 * changed as a result of the call).
+	 * 移除元素的操作
+	 * 首先根据元素找到对应元素的下标
+	 * 然后如果有对应下标，那就调用remove(Object o, Object[] snapshot, int index)方法进行删除操作
 	 *
 	 * @param o element to be removed from this list, if present
 	 * @return {@code true} if this list contained the specified element
 	 */
 	public boolean remove(Object o) {
 		Object[] snapshot = getArray();
+		// 找到移除元素的下标
 		int index = indexOfRange(o, snapshot, 0, snapshot.length);
 		return index >= 0 && remove(o, snapshot, index);
 	}
@@ -1028,7 +1061,8 @@ public class CopyOnWriteArrayList<E>
 	}
 
 	/**
-	 * Returns an iterator over the elements in this list in proper sequence.
+	 * 这个就是为什么可以实现读写分离的原因，这里的迭代器是创建的COWIterator，这个迭代器中引用的array是CopyOnWriteArrayList的array。
+	 * 但是在写操作的过程中，还没有将array指向写操作中新创建的数组，所以这是弱数据一致性。
 	 *
 	 * <p>The returned iterator provides a snapshot of the state of the list
 	 * when the iterator was constructed. No synchronization is needed while
